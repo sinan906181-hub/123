@@ -11,7 +11,7 @@ import {
   ShieldCheck,
   Trash2,
 } from 'lucide-react';
-import { DEFAULT_CMS_STATE } from '../../data/defaultCmsState';
+import { DEFAULT_CMS_STATE } from '../../config/defaultCmsState';
 import { adminApi } from '../../lib/adminApi';
 import type {
   ActivityLogItem,

@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { DEFAULT_CMS_STATE } from '../data/defaultCmsState';
+import { DEFAULT_CMS_STATE } from '../config/defaultCmsState';
 import { getStoredAdminToken } from '../lib/adminApi';
 import type { CmsSiteState } from '../types/cms';
 

@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { DEFAULT_CMS_STATE } from '../src/data/defaultCmsState.ts';
+import { DEFAULT_CMS_STATE } from '../src/config/defaultCmsState.ts';
 import type {
   ActivityLogItem,
   CmsSiteState,
