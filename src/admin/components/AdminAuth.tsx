@@ -3,10 +3,12 @@ import { Eye, EyeOff, Lock } from 'lucide-react';
 import { adminApi } from '../../lib/adminApi';
 
 interface AdminAuthProps {
+  sessionNotice?: string;
   onSuccess: (user: { id: string; email: string; username: string }) => void;
+  onBack?: () => void;
 }
 
-export const AdminAuth: React.FC<AdminAuthProps> = ({ onSuccess }) => {
+export const AdminAuth: React.FC<AdminAuthProps> = ({ sessionNotice, onSuccess, onBack }) => {
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -83,8 +85,8 @@ export const AdminAuth: React.FC<AdminAuthProps> = ({ onSuccess }) => {
     try {
       const res = await adminApi.login({ password });
       onSuccess(res.user);
-    } catch {
-      setError('Incorrect password');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Incorrect password');
     } finally {
       setLoading(false);
     }
@@ -133,9 +135,9 @@ export const AdminAuth: React.FC<AdminAuthProps> = ({ onSuccess }) => {
             </button>
           </div>
 
-          {error && (
+          {(error || sessionNotice) && (
             <div role="alert" className="text-center text-xs font-mono text-zinc-300">
-              {error}
+              {error || sessionNotice}
             </div>
           )}
 
@@ -146,6 +148,16 @@ export const AdminAuth: React.FC<AdminAuthProps> = ({ onSuccess }) => {
           >
             {loading ? 'VERIFYING...' : 'LOGIN'}
           </button>
+
+          {onBack && (
+            <button
+              type="button"
+              onClick={onBack}
+              className="w-full py-2 text-[11px] font-mono text-zinc-500 hover:text-zinc-200 transition-colors"
+            >
+              ← Return to Website
+            </button>
+          )}
         </form>
       </div>
     </div>

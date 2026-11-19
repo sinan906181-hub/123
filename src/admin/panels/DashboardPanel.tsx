@@ -9,7 +9,8 @@ import {
   Sparkles,
   Upload,
 } from 'lucide-react';
-import type { DashboardOverview } from '../../types/cms';
+import type { AdminSecuritySettings, DashboardOverview } from '../../types/cms';
+import { SecurityOverviewStrip } from './SecurityPanels';
 
 export type AdminTabId =
   | 'dashboard'
@@ -20,16 +21,22 @@ export type AdminTabId =
   | 'media'
   | 'messages'
   | 'motion'
-  | 'design';
+  | 'design'
+  | 'security'
+  | 'website-lock'
+  | 'admin-access'
+  | 'logs';
 
 interface DashboardPanelProps {
   overview: DashboardOverview;
+  security?: AdminSecuritySettings | null;
   onNavigateTab: (tab: AdminTabId) => void;
   onOpenPreview: () => void;
 }
 
 export const DashboardPanel: React.FC<DashboardPanelProps> = ({
   overview,
+  security,
   onNavigateTab,
   onOpenPreview,
 }) => {
@@ -48,9 +55,13 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
     },
     {
       label: 'WEBSITE STATUS',
-      value: websiteStatus,
-      sub: overview.hasUnpublishedChanges ? 'Draft pending publish' : 'Synced with live',
-      tab: 'design' as AdminTabId,
+      value: security?.websiteLock.enabled ? 'LOCKED' : websiteStatus,
+      sub: security?.websiteLock.enabled
+        ? 'Protected by Website Lock'
+        : overview.hasUnpublishedChanges
+          ? 'Draft pending publish'
+          : 'Synced with live',
+      tab: (security?.websiteLock.enabled ? 'website-lock' : 'design') as AdminTabId,
       icon: Activity,
     },
   ];
@@ -59,13 +70,15 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
     { label: '+ UPLOAD PHOTO', tab: 'media' as AdminTabId, icon: Upload },
     { label: '+ ADD SERVICE', tab: 'services' as AdminTabId, icon: Plus },
     { label: '+ ADD SKILL', tab: 'skills' as AdminTabId, icon: Plus },
-    { label: 'EDIT HOME', tab: 'home' as AdminTabId, icon: Sparkles },
-    { label: 'EDIT ABOUT', tab: 'about' as AdminTabId, icon: Layers },
-    { label: 'VIEW MESSAGES', tab: 'messages' as AdminTabId, icon: Mail },
+    { label: 'WEBSITE LOCK', tab: 'website-lock' as AdminTabId, icon: Sparkles },
+    { label: 'ADMIN SHORTCUT', tab: 'admin-access' as AdminTabId, icon: Layers },
+    { label: 'SECURITY LOGS', tab: 'logs' as AdminTabId, icon: Mail },
   ];
 
   return (
     <div className="space-y-8">
+      {security && <SecurityOverviewStrip security={security} onNavigateTab={onNavigateTab} />}
+
       {/* Top KPI Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
         {statCards.map((card) => {
@@ -236,7 +249,7 @@ export const DashboardPanel: React.FC<DashboardPanelProps> = ({
             <h3 className="font-display text-base font-semibold text-white">Activity Log</h3>
             <button
               type="button"
-              onClick={() => onNavigateTab('design')}
+              onClick={() => onNavigateTab('logs')}
               className="text-xs font-mono text-zinc-400 hover:text-white"
             >
               Full Log →

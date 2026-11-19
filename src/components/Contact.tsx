@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { useSiteConfig } from '../context/SiteConfigContext';
+import { getStoredUnlockToken } from '../lib/adminApi';
 import { SocialIcon } from './Icons';
 import { MagneticWrapper } from '../motion/MotionPrimitives';
 import {
@@ -127,9 +128,13 @@ export const Contact: React.FC<ContactProps> = ({ preselectedService }) => {
     setErrors({});
     setIsSubmitting(true);
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const unlockToken = getStoredUnlockToken();
+      if (unlockToken) headers['x-site-unlock'] = unlockToken;
       const res = await fetch('/api/public/contact', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
+        credentials: 'same-origin',
         body: JSON.stringify(form),
       });
       const json = (await res.json().catch(() => ({}))) as { error?: string };

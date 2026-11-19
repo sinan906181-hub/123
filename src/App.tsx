@@ -3,9 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { MotionConfig } from 'motion/react';
-import { AdminApp } from './admin/AdminApp';
 import { About } from './components/About';
 import { Contact } from './components/Contact';
 import { Footer } from './components/Footer';
@@ -14,7 +13,10 @@ import { Hero } from './components/Hero';
 import { BrandMark } from './components/Icons';
 import { Services } from './components/Services';
 import { Skills } from './components/Skills';
+import { WebsiteLockScreen } from './components/WebsiteLockScreen';
 import { SiteConfigProvider, useSiteConfig } from './context/SiteConfigContext';
+import { computeShortcutDigest } from './lib/securityHash';
+import { normalizeShortcutKey, serializeCanonicalShortcut } from './lib/shortcut';
 import {
   ExperimentalAtmosphereCanvas,
   ExperimentalCursorPortal,
@@ -30,12 +32,16 @@ import {
 import { ScrollProgressHUD } from './motion/MotionPrimitives';
 import { MuhammedSinanIntro } from './motion/MuhammedSinanIntro';
 
+const AdminApp = lazy(() =>
+  import('./admin/AdminApp').then((mod) => ({ default: mod.AdminApp }))
+);
+
 function isAdminPath(pathname: string): boolean {
   return pathname === '/admin' || pathname.startsWith('/admin/');
 }
 
-const PublicPortfolio: React.FC<{ onOpenAdmin: () => void }> = ({ onOpenAdmin }) => {
-  const { cms, mode } = useSiteConfig();
+const PublicPortfolio: React.FC = () => {
+  const { cms, mode, locked, publicSecurity, loading, reloadSite } = useSiteConfig();
   const [activeSection, setActiveSection] = useState<string>('home');
   const [selectedService, setSelectedService] = useState<string | undefined>(undefined);
   const [pageTurn, setPageTurn] = useState<PageTurnState | null>(null);
@@ -319,6 +325,14 @@ const PublicPortfolio: React.FC<{ onOpenAdmin: () => void }> = ({ onOpenAdmin })
     return () => observer.disconnect();
   }, [introActive, siteRevealed, triggerTurnVisual, visibleSections]);
 
+  if (loading) {
+    return <div className="min-h-screen bg-[#050505]" aria-hidden="true" />;
+  }
+
+  if (locked && publicSecurity && mode !== 'preview') {
+    return <WebsiteLockScreen security={publicSecurity} onUnlocked={reloadSite} />;
+  }
+
   if (cms.settings.maintenanceMode && mode !== 'preview') {
     return (
       <div
@@ -338,15 +352,6 @@ const PublicPortfolio: React.FC<{ onOpenAdmin: () => void }> = ({ onOpenAdmin })
           <p className="text-sm sm:text-base text-zinc-400 leading-relaxed">
             {cms.settings.maintenanceMessage}
           </p>
-          <div className="pt-4">
-            <button
-              type="button"
-              onClick={onOpenAdmin}
-              className="text-xs font-mono text-zinc-500 hover:text-white transition-colors"
-            >
-              Studio Admin Login →
-            </button>
-          </div>
         </div>
       </div>
     );
@@ -407,7 +412,6 @@ const PublicPortfolio: React.FC<{ onOpenAdmin: () => void }> = ({ onOpenAdmin })
           <Footer
             onNavigate={scrollToSection}
             onReplayIntro={handleReplayIntro}
-            onOpenAdmin={onOpenAdmin}
           />
         )}
       </div>
@@ -416,21 +420,21 @@ const PublicPortfolio: React.FC<{ onOpenAdmin: () => void }> = ({ onOpenAdmin })
         <div className="fixed bottom-4 left-4 z-[90] flex items-center gap-3 px-4 py-2.5 rounded-full border border-white/25 bg-[#09090C]/90 backdrop-blur-xl text-xs font-mono text-white shadow-2xl">
           <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
           <span>DRAFT PREVIEW</span>
-          <button
-            type="button"
-            onClick={onOpenAdmin}
+          <a
+            href="/admin"
             className="underline underline-offset-4 text-zinc-300 hover:text-white"
           >
             Back to Admin
-          </button>
+          </a>
         </div>
       )}
     </div>
   );
 };
 
-export default function App() {
+const AppShell: React.FC = () => {
   const [pathname, setPathname] = useState<string>(() => window.location.pathname);
+  const { publicSecurity, reloadSite } = useSiteConfig();
 
   useEffect(() => {
     const onPopState = () => setPathname(window.location.pathname);
@@ -438,22 +442,91 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
-  const navigateTo = useCallback((path: string) => {
-    if (window.location.pathname !== path) {
-      window.history.pushState({}, '', path);
-      setPathname(path);
-      window.scrollTo({ top: 0, behavior: 'auto' });
-    }
-  }, []);
+  const navigateTo = useCallback(
+    (path: string) => {
+      if (window.location.pathname !== path) {
+        window.history.pushState({}, '', path);
+        setPathname(path);
+        window.scrollTo({ top: 0, behavior: 'auto' });
+        if (!isAdminPath(path)) {
+          reloadSite().catch(() => {});
+        }
+      }
+    },
+    [reloadSite]
+  );
 
+  // Global hidden admin portal keyboard shortcut listener
+  useEffect(() => {
+    if (isAdminPath(pathname)) return;
+    const challenge = publicSecurity?.shortcutChallenge;
+    const expectedDigest = publicSecurity?.shortcutDigest;
+    if (!challenge || !expectedDigest) return;
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      if (!e.ctrlKey && !e.altKey && !e.metaKey) return;
+
+      const target = e.target as HTMLElement | null;
+      const isEditable =
+        Boolean(target) &&
+        (target!.tagName === 'INPUT' ||
+          target!.tagName === 'TEXTAREA' ||
+          target!.tagName === 'SELECT' ||
+          target!.isContentEditable);
+      const allowInField = target?.getAttribute('data-allow-admin-shortcut') === 'true';
+      if (isEditable && !allowInField) return;
+
+      const key = normalizeShortcutKey(e.key, e.code);
+      if (!key) return;
+
+      const canonical = serializeCanonicalShortcut({
+        ctrl: e.ctrlKey,
+        shift: e.shiftKey,
+        alt: e.altKey,
+        meta: e.metaKey,
+        key,
+      });
+
+      computeShortcutDigest(challenge, canonical)
+        .then((digest) => {
+          if (digest && digest === expectedDigest) {
+            e.preventDefault();
+            e.stopPropagation();
+            navigateTo('/admin');
+          }
+        })
+        .catch(() => {});
+    };
+
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [navigateTo, pathname, publicSecurity?.shortcutChallenge, publicSecurity?.shortcutDigest]);
+
+  if (isAdminPath(pathname)) {
+    return (
+      <Suspense
+        fallback={
+          <div className="min-h-screen bg-[#050505] text-white flex items-center justify-center">
+            <div className="text-xs font-mono tracking-[0.2em] text-zinc-400">
+              LOADING ADMIN PORTAL...
+            </div>
+          </div>
+        }
+      >
+        <AdminApp onExitAdmin={() => navigateTo('/')} />
+      </Suspense>
+    );
+  }
+
+  return <PublicPortfolio />;
+};
+
+export default function App() {
   return (
     <MotionConfig reducedMotion="user">
       <SiteConfigProvider>
-        {isAdminPath(pathname) ? (
-          <AdminApp onExitAdmin={() => navigateTo('/')} />
-        ) : (
-          <PublicPortfolio onOpenAdmin={() => navigateTo('/admin')} />
-        )}
+        <AppShell />
       </SiteConfigProvider>
     </MotionConfig>
   );

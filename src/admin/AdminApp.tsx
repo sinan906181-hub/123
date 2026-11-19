@@ -1,11 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  Activity,
   Check,
   ExternalLink,
   Home,
   Image as ImageIcon,
+  Keyboard,
   Layers,
   LayoutDashboard,
+  Lock,
   LogOut,
   Mail,
   Menu,
@@ -14,14 +17,20 @@ import {
   Save,
   Search,
   Send,
+  Shield,
   Sparkles,
   User,
   Wand2,
   X,
 } from 'lucide-react';
 import { BrandMark } from '../components/Icons';
-import { adminApi } from '../lib/adminApi';
-import type { CmsSiteState, ContactMessage, DashboardOverview } from '../types/cms';
+import { adminApi, notifySecurityUpdated } from '../lib/adminApi';
+import type {
+  AdminSecuritySettings,
+  CmsSiteState,
+  ContactMessage,
+  DashboardOverview,
+} from '../types/cms';
 import { AdminAuth } from './components/AdminAuth';
 import { DeleteConfirmModal } from './components/AdminPrimitives';
 import {
@@ -33,6 +42,12 @@ import {
 import { type AdminTabId, DashboardPanel } from './panels/DashboardPanel';
 import { MediaManagerPanel, MessagesPanel } from './panels/MediaMessagesPanels';
 import { DesignSeoSettingsPanel, MotionStudioPanel } from './panels/MotionDesignSeoPanels';
+import {
+  AdminAccessShortcutPanel,
+  SecurityActivityLogsPanel,
+  SecurityOverviewPanel,
+  WebsiteLockPanel,
+} from './panels/SecurityPanels';
 
 interface AdminAppProps {
   onExitAdmin: () => void;
@@ -63,10 +78,19 @@ const NAV_GROUPS: {
     ],
   },
   {
+    title: 'Security & Access',
+    items: [
+      { id: 'security', label: 'Security', icon: Shield },
+      { id: 'website-lock', label: 'Website Lock', icon: Lock },
+      { id: 'admin-access', label: 'Admin Access · Shortcut', icon: Keyboard },
+      { id: 'logs', label: 'Activity & Security Logs', icon: Activity },
+    ],
+  },
+  {
     title: 'Experience & System',
     items: [
       { id: 'motion', label: 'Motion & Particles', icon: Wand2 },
-      { id: 'design', label: 'Design, SEO & Settings', icon: Palette },
+      { id: 'design', label: 'General & Design Settings', icon: Palette },
     ],
   },
 ];
@@ -74,8 +98,12 @@ const NAV_GROUPS: {
 export const AdminApp: React.FC<AdminAppProps> = ({ onExitAdmin }) => {
   const [authLoading, setAuthLoading] = useState(true);
   const [user, setUser] = useState<{ id: string; email: string; username: string } | null>(null);
+  const [sessionNotice, setSessionNotice] = useState('');
 
   const [overview, setOverview] = useState<DashboardOverview | null>(null);
+  const [security, setSecurity] = useState<AdminSecuritySettings | null>(null);
+  const [securityLoading, setSecurityLoading] = useState(false);
+  const [securityError, setSecurityError] = useState('');
   const [draft, setDraft] = useState<CmsSiteState | null>(null);
   const [localDirty, setLocalDirty] = useState(false);
 
@@ -97,18 +125,95 @@ export const AdminApp: React.FC<AdminAppProps> = ({ onExitAdmin }) => {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const loadDashboard = useCallback(async (syncDraft = true) => {
-    const data = await adminApi.getOverview();
-    setOverview(data);
-    if (syncDraft) {
-      setDraft(data.draft);
-      setLocalDirty(false);
+  const loadSecurity = useCallback(async () => {
+    setSecurityLoading(true);
+    setSecurityError('');
+    try {
+      const secRes = await adminApi.getSecurity();
+      setSecurity(secRes.settings);
+      notifySecurityUpdated(secRes.publicSecurity);
+      return secRes.settings;
+    } catch (err) {
+      setSecurityError(err instanceof Error ? err.message : 'Unable to load security settings.');
+      return null;
+    } finally {
+      setSecurityLoading(false);
     }
-    adminApi
-      .listMessages()
-      .then((res) => setAllMessages(res.items))
-      .catch(() => {});
   }, []);
+
+  const loadDashboard = useCallback(
+    async (syncDraft = true) => {
+      const [data, secRes] = await Promise.all([
+        adminApi.getOverview(),
+        adminApi
+          .getSecurity()
+          .then((res) => {
+            setSecurityError('');
+            return res;
+          })
+          .catch((err) => {
+            setSecurityError(
+              err instanceof Error ? err.message : 'Unable to load security settings.'
+            );
+            return null;
+          }),
+      ]);
+      setOverview(data);
+      if (secRes?.settings) {
+        setSecurity(secRes.settings);
+        notifySecurityUpdated(secRes.publicSecurity);
+      }
+      if (syncDraft) {
+        setDraft(data.draft);
+        setLocalDirty(false);
+      }
+      adminApi
+        .listMessages()
+        .then((res) => setAllMessages(res.items))
+        .catch(() => {});
+    },
+    []
+  );
+
+  const handleLockOrLogout = useCallback(async (notice = '') => {
+    await adminApi.logout();
+    setUser(null);
+    setSessionNotice(notice);
+  }, []);
+
+  useEffect(() => {
+    const onUnauthorized = () => {
+      setUser(null);
+      setSessionNotice('Admin session expired. Please sign in again.');
+    };
+    window.addEventListener('ms:admin-unauthorized', onUnauthorized);
+    return () => window.removeEventListener('ms:admin-unauthorized', onUnauthorized);
+  }, []);
+
+  // Client-side inactivity timeout synced with server sessionTimeoutMinutes
+  useEffect(() => {
+    if (!user) return;
+    const timeoutMinutes = security?.sessionTimeoutMinutes || 30;
+    const timeoutMs = Math.max(5, timeoutMinutes) * 60 * 1000;
+    let timer = window.setTimeout(() => {
+      handleLockOrLogout('Admin session timed out due to inactivity.');
+    }, timeoutMs);
+
+    const bump = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        handleLockOrLogout('Admin session timed out due to inactivity.');
+      }, timeoutMs);
+    };
+
+    window.addEventListener('pointerdown', bump, { passive: true });
+    window.addEventListener('keydown', bump, { passive: true });
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('pointerdown', bump);
+      window.removeEventListener('keydown', bump);
+    };
+  }, [handleLockOrLogout, security?.sessionTimeoutMinutes, user]);
 
   useEffect(() => {
     let mounted = true;
@@ -129,6 +234,19 @@ export const AdminApp: React.FC<AdminAppProps> = ({ onExitAdmin }) => {
       mounted = false;
     };
   }, [loadDashboard]);
+
+  useEffect(() => {
+    if (!user) return;
+    if (
+      (activeTab === 'security' ||
+        activeTab === 'website-lock' ||
+        activeTab === 'admin-access') &&
+      !security &&
+      !securityLoading
+    ) {
+      loadSecurity();
+    }
+  }, [activeTab, loadSecurity, security, securityLoading, user]);
 
   const handleDraftChange = useCallback((next: CmsSiteState) => {
     setDraft(next);
@@ -231,7 +349,10 @@ export const AdminApp: React.FC<AdminAppProps> = ({ onExitAdmin }) => {
   if (!user) {
     return (
       <AdminAuth
+        sessionNotice={sessionNotice}
+        onBack={onExitAdmin}
         onSuccess={async (authenticatedUser) => {
+          setSessionNotice('');
           setUser(authenticatedUser);
           await loadDashboard(true);
         }}
@@ -351,14 +472,11 @@ export const AdminApp: React.FC<AdminAppProps> = ({ onExitAdmin }) => {
           </div>
           <button
             type="button"
-            onClick={async () => {
-              await adminApi.logout();
-              setUser(null);
-            }}
+            onClick={() => handleLockOrLogout()}
             className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 rounded-xl border border-white/15 text-xs text-zinc-300 hover:bg-white hover:text-black transition-colors"
           >
             <LogOut className="w-3.5 h-3.5" />
-            <span>Sign Out</span>
+            <span>Sign Out / Lock</span>
           </button>
         </div>
       </aside>
@@ -509,6 +627,7 @@ export const AdminApp: React.FC<AdminAppProps> = ({ onExitAdmin }) => {
           {activeTab === 'dashboard' && (
             <DashboardPanel
               overview={overview}
+              security={security}
               onNavigateTab={setActiveTab}
               onOpenPreview={() => {
                 if (localDirty) {
@@ -522,6 +641,57 @@ export const AdminApp: React.FC<AdminAppProps> = ({ onExitAdmin }) => {
               }}
             />
           )}
+          {(activeTab === 'security' ||
+            activeTab === 'website-lock' ||
+            activeTab === 'admin-access') &&
+            !security && (
+              <div className="p-8 rounded-2xl border border-white/10 bg-[#09090C] text-center space-y-4">
+                <div className="text-xs font-mono tracking-[0.18em] text-zinc-400 uppercase">
+                  {securityLoading
+                    ? 'Loading Security & Website Lock Settings...'
+                    : securityError || 'Security settings could not be loaded.'}
+                </div>
+                {!securityLoading && (
+                  <button
+                    type="button"
+                    onClick={() => loadSecurity()}
+                    className="px-5 py-2.5 rounded-full bg-white text-black text-xs font-semibold hover:bg-zinc-200 transition-colors"
+                  >
+                    Retry Loading Security
+                  </button>
+                )}
+              </div>
+            )}
+          {activeTab === 'security' && security && (
+            <SecurityOverviewPanel
+              security={security}
+              onSecurityChange={setSecurity}
+              onNavigateTab={setActiveTab}
+              onLockAdminSession={() =>
+                handleLockOrLogout('Admin session locked. Sign in again to continue.')
+              }
+              onNotify={notify}
+            />
+          )}
+          {activeTab === 'website-lock' && security && (
+            <WebsiteLockPanel
+              security={security}
+              onSecurityChange={setSecurity}
+              onLockAdminSession={() =>
+                handleLockOrLogout('Admin session locked. Sign in again to continue.')
+              }
+              onNotify={notify}
+            />
+          )}
+          {activeTab === 'admin-access' && security && (
+            <AdminAccessShortcutPanel
+              security={security}
+              onSecurityChange={setSecurity}
+              onNavigateTab={setActiveTab}
+              onNotify={notify}
+            />
+          )}
+          {activeTab === 'logs' && <SecurityActivityLogsPanel />}
           {activeTab === 'home' && (
             <HomeEditorPanel draft={draft} onChange={handleDraftChange} />
           )}

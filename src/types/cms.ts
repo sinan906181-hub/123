@@ -405,3 +405,40 @@ export interface DashboardOverview {
   draft: CmsSiteState;
   published: CmsSiteState;
 }
+
+export interface AdminShortcutConfig {
+  ctrl: boolean;
+  shift: boolean;
+  alt: boolean;
+  meta: boolean;
+  key: string;
+  label: string;
+}
+
+export type WebsiteLockType = 'password' | 'pin';
+
+export interface PublicSecurityState {
+  locked: boolean;
+  lockType: WebsiteLockType;
+  lockMessage: string;
+  siteName: string;
+  logoUrl: string;
+  shortcutChallenge: string;
+  shortcutDigest: string;
+}
+
+export interface AdminSecuritySettings {
+  shortcut: AdminShortcutConfig;
+  defaultShortcutLabel: string;
+  websiteLock: {
+    enabled: boolean;
+    lockType: WebsiteLockType;
+    lockMessage: string;
+    hasCredential: boolean;
+  };
+  sessionTimeoutMinutes: number;
+  lastSecurityChangeAt: string | null;
+  adminProtected: boolean;
+  websiteStatus: 'ONLINE' | 'LOCKED' | 'MAINTENANCE';
+}
+

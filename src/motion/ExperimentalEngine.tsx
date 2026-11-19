@@ -1243,10 +1243,10 @@ export const ParticleTextReconstruction: React.FC<{
     let rafId = 0;
     let isVisible = false;
     const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-    const width = Math.min(container.clientWidth || 720, 920);
+    const width = Math.max(2, Math.floor(Math.min(container.clientWidth || 720, 920)));
     const height = 128;
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(height * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // Sample target pixel coordinates for the active phrase

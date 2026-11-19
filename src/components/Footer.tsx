@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ArrowUp, RotateCcw, Shield } from 'lucide-react';
+import { ArrowUp, RotateCcw } from 'lucide-react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { useSiteConfig } from '../context/SiteConfigContext';
 import { BrandMark, SocialIcon } from './Icons';
@@ -9,13 +9,11 @@ import { EASE_CINEMATIC, VIEWPORT_CONFIG } from '../motion/motionSystem';
 interface FooterProps {
   onNavigate: (sectionId: string) => void;
   onReplayIntro?: () => void;
-  onOpenAdmin?: () => void;
 }
 
 export const Footer: React.FC<FooterProps> = ({
   onNavigate,
   onReplayIntro,
-  onOpenAdmin,
 }) => {
   const { cms } = useSiteConfig();
   const shouldReduceMotion = useReducedMotion();
@@ -196,22 +194,7 @@ export const Footer: React.FC<FooterProps> = ({
 
         <div className="pt-8 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 text-xs text-zinc-500">
           <p>{cms.footer.copyright}</p>
-          <div className="flex items-center gap-5">
-            <p className="text-zinc-400">{cms.footer.craftNote}</p>
-            {onOpenAdmin && (
-              <a
-                href="/admin"
-                onClick={(e) => {
-                  e.preventDefault();
-                  onOpenAdmin();
-                }}
-                className="inline-flex items-center gap-1.5 text-zinc-500 hover:text-white transition-colors font-mono"
-              >
-                <Shield className="w-3 h-3" />
-                <span>Admin Portal</span>
-              </a>
-            )}
-          </div>
+          <p className="text-zinc-400">{cms.footer.craftNote}</p>
         </div>
       </div>
     </footer>

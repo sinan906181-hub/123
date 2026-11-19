@@ -23,11 +23,19 @@ function sampleSequentialPhrasePoints(
   maxPoints: number,
   textScale = 1
 ): SampledResult {
+  const safeW = Math.floor(width);
+  const safeH = Math.floor(height);
+  if (!Number.isFinite(safeW) || !Number.isFinite(safeH) || safeW < 2 || safeH < 2) {
+    return { points: new Float32Array(0), count: 0 };
+  }
+
   const off = document.createElement('canvas');
-  off.width = width;
-  off.height = height;
+  off.width = safeW;
+  off.height = safeH;
   const ctx = off.getContext('2d');
-  if (!ctx) return { points: new Float32Array(0), count: 0 };
+  if (!ctx || off.width < 2 || off.height < 2) {
+    return { points: new Float32Array(0), count: 0 };
+  }
 
   const rawText = (text || 'Developer • Designer • Creator').trim();
   // Tokenize into sequential segments, keeping bullets '•' as discrete subtle nodes
@@ -36,7 +44,7 @@ function sampleSequentialPhrasePoints(
     .map((t) => t.trim())
     .filter(Boolean);
 
-  const isNarrow = width < 680;
+  const isNarrow = safeW < 680;
   const wordCount = tokens.filter((t) => t !== '•').length;
 
   interface SegmentBox {
@@ -50,8 +58,8 @@ function sampleSequentialPhrasePoints(
 
   const boxes: SegmentBox[] = [];
   const baseFontSize = isNarrow
-    ? Math.max(26, Math.min(44, width * 0.088)) * textScale
-    : Math.max(38, Math.min(72, width * 0.044)) * textScale;
+    ? Math.max(26, Math.min(44, safeW * 0.088)) * textScale
+    : Math.max(38, Math.min(72, safeW * 0.044)) * textScale;
 
   const mainFont = `600 ${Math.round(baseFontSize)}px "Outfit", "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif`;
   const bulletFont = `500 ${Math.round(baseFontSize * 0.56)}px "Outfit", "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif`;
@@ -74,12 +82,12 @@ function sampleSequentialPhrasePoints(
   };
 
   let { total: lineWidth, widths } = measureSingleLine();
-  let useStacked = isNarrow && wordCount >= 2 && lineWidth > width * 0.88;
+  const useStacked = isNarrow && wordCount >= 2 && lineWidth > safeW * 0.88;
 
   // If slightly wider than desktop safe margin, scale font gently so single-line fits seamlessly
   let effectiveScale = 1;
-  if (!useStacked && lineWidth > width * 0.86) {
-    effectiveScale = (width * 0.86) / Math.max(lineWidth, 1);
+  if (!useStacked && lineWidth > safeW * 0.86) {
+    effectiveScale = (safeW * 0.86) / Math.max(lineWidth, 1);
   }
 
   const finalFontSize = Math.round(baseFontSize * effectiveScale);
@@ -97,14 +105,14 @@ function sampleSequentialPhrasePoints(
       return w;
     });
 
-    let cursorX = width * 0.5 - lineWidth * 0.5;
+    let cursorX = safeW * 0.5 - lineWidth * 0.5;
     for (let i = 0; i < tokens.length; i++) {
       const tok = tokens[i];
       const isBullet = tok === '•';
       boxes.push({
         token: tok,
         x: cursorX + widths[i] * 0.5,
-        y: height * 0.5,
+        y: safeH * 0.5,
         font: isBullet ? finalBulletFont : finalMainFont,
         isBullet,
         order: tokens.length > 1 ? i / (tokens.length - 1) : 0,
@@ -116,7 +124,7 @@ function sampleSequentialPhrasePoints(
     const nonBulletCount = tokens.filter((t) => t !== '•').length;
     const totalLines = tokens.length;
     const stepY = finalFontSize * 0.92;
-    const startY = height * 0.5 - ((totalLines - 1) * stepY) * 0.5;
+    const startY = safeH * 0.5 - ((totalLines - 1) * stepY) * 0.5;
     void nonBulletCount;
 
     for (let i = 0; i < tokens.length; i++) {
@@ -124,7 +132,7 @@ function sampleSequentialPhrasePoints(
       const isBullet = tok === '•';
       boxes.push({
         token: tok,
-        x: width * 0.5,
+        x: safeW * 0.5,
         y: startY + i * stepY,
         font: isBullet ? finalBulletFont : finalMainFont,
         isBullet,
@@ -134,10 +142,10 @@ function sampleSequentialPhrasePoints(
   }
 
   const rawPoints: number[] = [];
-  const step = isNarrow ? 2 : width > 1280 ? 2 : 2;
+  const step = 2;
 
   for (const box of boxes) {
-    ctx.clearRect(0, 0, width, height);
+    ctx.clearRect(0, 0, safeW, safeH);
     ctx.fillStyle = '#FFFFFF';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
@@ -148,16 +156,16 @@ function sampleSequentialPhrasePoints(
     const padX = Math.ceil(metrics.width * 0.65) + 12;
     const padY = Math.ceil(finalFontSize * 0.85) + 12;
     const minX = Math.max(0, Math.floor(box.x - padX));
-    const maxX = Math.min(width, Math.ceil(box.x + padX));
+    const maxX = Math.min(safeW, Math.ceil(box.x + padX));
     const minY = Math.max(0, Math.floor(box.y - padY));
-    const maxY = Math.min(height, Math.ceil(box.y + padY));
+    const maxY = Math.min(safeH, Math.ceil(box.y + padY));
 
-    const imgData = ctx.getImageData(0, 0, width, height).data;
+    const imgData = ctx.getImageData(0, 0, safeW, safeH).data;
     const localStep = box.isBullet ? 1 : step;
 
     for (let y = minY; y < maxY; y += localStep) {
       for (let x = minX; x < maxX; x += localStep) {
-        if (imgData[(y * width + x) * 4 + 3] > 118) {
+        if (imgData[(y * safeW + x) * 4 + 3] > 118) {
           rawPoints.push(x, y, box.order);
         }
       }
@@ -213,14 +221,49 @@ export const MuhammedSinanIntro: React.FC<MuhammedSinanIntroProps> = ({
     if (!ctx) return;
 
     let rafId = 0;
-    let width = window.innerWidth;
-    let height = window.innerHeight;
+    let width = Math.floor(wrap.clientWidth || window.innerWidth || document.documentElement?.clientWidth || 0);
+    let height = Math.floor(wrap.clientHeight || window.innerHeight || document.documentElement?.clientHeight || 0);
+
+    if (width < 2 || height < 2) {
+      let settled = false;
+      const checkReady = () => {
+        if (settled) return;
+        const w = Math.floor(wrap.clientWidth || window.innerWidth || 0);
+        const h = Math.floor(wrap.clientHeight || window.innerHeight || 0);
+        if (w >= 2 && h >= 2) {
+          settled = true;
+          clearTimeout(fallbackTimer);
+          window.removeEventListener('resize', checkReady);
+          ro?.disconnect();
+          onStartReveal();
+          onComplete();
+        }
+      };
+      const fallbackTimer = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        window.removeEventListener('resize', checkReady);
+        ro?.disconnect();
+        onStartReveal();
+        onComplete();
+      }, 350);
+      const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(checkReady) : null;
+      ro?.observe(wrap);
+      window.addEventListener('resize', checkReady, { passive: true });
+      return () => {
+        settled = true;
+        clearTimeout(fallbackTimer);
+        window.removeEventListener('resize', checkReady);
+        ro?.disconnect();
+      };
+    }
+
     const cores = navigator.hardwareConcurrency || 4;
     const isLowPower = cores <= 2 || width < 768;
     const dpr = Math.min(window.devicePixelRatio || 1, isLowPower ? 1.25 : 1.75);
 
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
+    canvas.width = Math.max(2, Math.floor(width * dpr));
+    canvas.height = Math.max(2, Math.floor(height * dpr));
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const maxTextPts = Math.round((isLowPower ? 1150 : 2650) * density);
@@ -345,10 +388,13 @@ export const MuhammedSinanIntro: React.FC<MuhammedSinanIntroProps> = ({
     window.addEventListener('keydown', onKeyDown);
 
     const onResize = () => {
-      width = window.innerWidth;
-      height = window.innerHeight;
-      canvas.width = width * dpr;
-      canvas.height = height * dpr;
+      const nextW = Math.floor(wrap.clientWidth || window.innerWidth || 0);
+      const nextH = Math.floor(wrap.clientHeight || window.innerHeight || 0);
+      if (nextW < 2 || nextH < 2) return;
+      width = nextW;
+      height = nextH;
+      canvas.width = Math.max(2, Math.floor(width * dpr));
+      canvas.height = Math.max(2, Math.floor(height * dpr));
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
     window.addEventListener('resize', onResize, { passive: true });

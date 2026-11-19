@@ -1,11 +1,17 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { DEFAULT_CMS_STATE } from '../config/defaultCmsState';
-import { getStoredAdminToken } from '../lib/adminApi';
-import type { CmsSiteState } from '../types/cms';
+import {
+  getStoredAdminToken,
+  getStoredUnlockToken,
+  setStoredUnlockToken,
+} from '../lib/adminApi';
+import type { CmsSiteState, PublicSecurityState } from '../types/cms';
 
 interface SiteConfigContextValue {
   cms: CmsSiteState;
-  mode: 'published' | 'preview';
+  mode: 'published' | 'preview' | 'locked';
+  locked: boolean;
+  publicSecurity: PublicSecurityState | null;
   loading: boolean;
   reloadSite: () => Promise<void>;
 }
@@ -13,6 +19,8 @@ interface SiteConfigContextValue {
 const SiteConfigContext = createContext<SiteConfigContextValue>({
   cms: DEFAULT_CMS_STATE,
   mode: 'published',
+  locked: false,
+  publicSecurity: null,
   loading: true,
   reloadSite: async () => {},
 });
@@ -30,7 +38,9 @@ function setMetaTag(attrName: 'name' | 'property', attrVal: string, content: str
 
 export const SiteConfigProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [cms, setCms] = useState<CmsSiteState>(DEFAULT_CMS_STATE);
-  const [mode, setMode] = useState<'published' | 'preview'>('published');
+  const [mode, setMode] = useState<'published' | 'preview' | 'locked'>('published');
+  const [locked, setLocked] = useState<boolean>(false);
+  const [publicSecurity, setPublicSecurity] = useState<PublicSecurityState | null>(null);
   const [loading, setLoading] = useState(true);
 
   const reloadSite = useCallback(async () => {
@@ -42,20 +52,36 @@ export const SiteConfigProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     if (wantsPreview && token) {
       headers.Authorization = `Bearer ${token}`;
     }
+    const unlockToken = getStoredUnlockToken();
+    if (unlockToken) {
+      headers['x-site-unlock'] = unlockToken;
+    }
 
     try {
       const res = await fetch(url, { headers, credentials: 'same-origin' });
       if (!res.ok) return;
       const json = (await res.json()) as {
-        mode: 'published' | 'preview';
-        data: CmsSiteState;
+        mode: 'published' | 'preview' | 'locked';
+        locked?: boolean;
+        data: CmsSiteState | null;
+        security?: PublicSecurityState;
       };
-      if (json?.data) {
-        setCms(json.data);
+      if (json.security) {
+        setPublicSecurity(json.security);
+      }
+      if (json.locked || json.mode === 'locked') {
+        setStoredUnlockToken(null);
+        setLocked(true);
+        setMode('locked');
+      } else {
+        setLocked(false);
+        if (json?.data) {
+          setCms(json.data);
+        }
         setMode(json.mode || 'published');
       }
     } catch {
-      // Keep default/cached state
+      // Keep current state
     } finally {
       setLoading(false);
     }
@@ -75,16 +101,33 @@ export const SiteConfigProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     } catch {
       // Ignore unsupported
     }
+    const onSecurityUpdated = (ev: Event) => {
+      const custom = ev as CustomEvent<PublicSecurityState | undefined>;
+      if (custom.detail) {
+        setPublicSecurity(custom.detail);
+        setLocked(Boolean(custom.detail.locked));
+      }
+      reloadSite();
+    };
     const onFocus = () => reloadSite();
     window.addEventListener('focus', onFocus);
+    window.addEventListener('ms:security-updated', onSecurityUpdated);
     return () => {
       channel?.close();
       window.removeEventListener('focus', onFocus);
+      window.removeEventListener('ms:security-updated', onSecurityUpdated);
     };
   }, [reloadSite]);
 
   // Apply dynamic Theme, Typography & SEO tags to DOM
   useEffect(() => {
+    if (locked) {
+      document.title = publicSecurity?.siteName
+        ? `${publicSecurity.siteName} — Locked`
+        : 'Protected Website';
+      return;
+    }
+
     const root = document.documentElement;
     const { theme, typography, seo, settings } = cms;
 
@@ -138,10 +181,10 @@ export const SiteConfigProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       }
       icon.href = settings.faviconUrl;
     }
-  }, [cms]);
+  }, [cms, locked, publicSecurity]);
 
   return (
-    <SiteConfigContext.Provider value={{ cms, mode, loading, reloadSite }}>
+    <SiteConfigContext.Provider value={{ cms, mode, locked, publicSecurity, loading, reloadSite }}>
       {children}
     </SiteConfigContext.Provider>
   );

@@ -18,27 +18,38 @@ import {
   deleteSession,
   getDashboardOverview,
   getMediaItemById,
+  getPublicSecurityState,
+  getAdminSecuritySettings,
   getSessionUser,
   getSiteDocument,
   hasAdminUsers,
   insertMediaItem,
+  isWebsiteLockedForToken,
   listContactMessages,
   listMediaFolders,
   listMediaItems,
   listRecentActivity,
   logActivity,
+  resetAdminShortcut,
+  resetSecuritySettings,
   saveSiteDocument,
+  setWebsiteLockActive,
   updateAdminPassword,
+  updateAdminShortcut,
   updateContactMessageRecord,
   updateMediaItemRecord,
+  updateSessionTimeoutMinutes,
+  updateWebsiteLockSettings,
+  verifySiteLockCredential,
 } from './server/db.ts';
-import type { CmsSiteState, MessageStatus } from './src/types/cms.ts';
+import type { CmsSiteState, MessageStatus, WebsiteLockType } from './src/types/cms.ts';
 
 bootstrapDatabase();
 
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 const SESSION_COOKIE = 'ms_admin_session';
+const UNLOCK_COOKIE = 'ms_site_unlock';
 
 const ALLOWED_EXTENSIONS = new Set([
   '.jpg',
@@ -117,6 +128,68 @@ function extractSessionToken(req: Request): string | null {
   return cookies[SESSION_COOKIE] || null;
 }
 
+function extractUnlockToken(req: Request): string | null {
+  const headerToken = req.headers['x-site-unlock'];
+  if (typeof headerToken === 'string' && headerToken.trim()) {
+    return headerToken.trim();
+  }
+  const cookies = parseCookies(req.headers.cookie);
+  return cookies[UNLOCK_COOKIE] || null;
+}
+
+function getClientIp(req: Request): string {
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd.trim()) {
+    return fwd.split(',')[0].trim();
+  }
+  return req.ip || req.socket.remoteAddress || 'unknown';
+}
+
+interface RateBucket {
+  failures: number[];
+  blockedUntil: number;
+}
+
+const rateBuckets = new Map<string, RateBucket>();
+
+function checkRateLimit(scope: string, ip: string, windowMs: number): { allowed: boolean; retryAfterSec: number } {
+  const key = `${scope}:${ip}`;
+  const bucket = rateBuckets.get(key);
+  if (!bucket) return { allowed: true, retryAfterSec: 0 };
+  const now = Date.now();
+  if (bucket.blockedUntil > now) {
+    return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((bucket.blockedUntil - now) / 1000)) };
+  }
+  bucket.failures = bucket.failures.filter((ts) => now - ts < windowMs);
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+function recordRateFailure(
+  scope: string,
+  ip: string,
+  maxFailures: number,
+  windowMs: number,
+  lockoutMs: number
+): boolean {
+  const key = `${scope}:${ip}`;
+  const now = Date.now();
+  const bucket = rateBuckets.get(key) || { failures: [], blockedUntil: 0 };
+  bucket.failures = bucket.failures.filter((ts) => now - ts < windowMs);
+  bucket.failures.push(now);
+  let triggeredLockout = false;
+  if (bucket.failures.length >= maxFailures) {
+    bucket.blockedUntil = now + lockoutMs;
+    bucket.failures = [];
+    triggeredLockout = true;
+  }
+  rateBuckets.set(key, bucket);
+  return triggeredLockout;
+}
+
+function clearRateLimit(scope: string, ip: string): void {
+  rateBuckets.delete(`${scope}:${ip}`);
+}
+
 interface AuthedRequest extends Request {
   adminUser?: { id: string; email: string; username: string };
 }
@@ -125,19 +198,36 @@ function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction): vo
   const token = extractSessionToken(req);
   const user = getSessionUser(token);
   if (!user) {
-    res.status(401).json({ error: 'Authentication required.' });
+    res.status(401).json({ error: 'Session expired or unauthorized. Please sign in.' });
     return;
   }
   req.adminUser = user;
   next();
 }
 
-function setSessionCookie(res: Response, signedToken: string): void {
+function isHttpsRequest(req: Request): boolean {
+  return Boolean(req.secure || req.headers['x-forwarded-proto'] === 'https');
+}
+
+function setSessionCookie(req: Request, res: Response, signedToken: string): void {
+  const secure = isHttpsRequest(req);
   res.cookie(SESSION_COOKIE, signedToken, {
     httpOnly: true,
-    sameSite: 'lax',
+    sameSite: secure ? 'none' : 'lax',
+    secure,
     path: '/',
     maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+}
+
+function setUnlockCookie(req: Request, res: Response, signedToken: string): void {
+  const secure = isHttpsRequest(req);
+  res.cookie(UNLOCK_COOKIE, signedToken, {
+    httpOnly: true,
+    sameSite: secure ? 'none' : 'lax',
+    secure,
+    path: '/',
+    maxAge: 24 * 60 * 60 * 1000,
   });
 }
 
@@ -161,6 +251,16 @@ async function startServer() {
   });
 
   app.post('/api/auth/login', (req: Request, res: Response) => {
+    const ip = getClientIp(req);
+    const limit = checkRateLimit('admin_login', ip, 15 * 60 * 1000);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSec));
+      res.status(429).json({
+        error: `Too many failed attempts. Try again in ${Math.ceil(limit.retryAfterSec / 60)} minute(s).`,
+      });
+      return;
+    }
+
     const { identifier, password } = req.body as { identifier?: string; password?: string };
     if (!password || typeof password !== 'string') {
       res.status(400).json({ error: 'Incorrect password' });
@@ -170,19 +270,36 @@ async function startServer() {
       ? authenticateAdmin(identifier, password)
       : authenticateAdminByPassword(password);
     if (!user) {
-      res.status(401).json({ error: 'Incorrect password' });
+      const lockedOut = recordRateFailure('admin_login', ip, 5, 15 * 60 * 1000, 15 * 60 * 1000);
+      logActivity(
+        lockedOut ? 'AUTH_RATE_LIMITED' : 'ADMIN_LOGIN_FAILED',
+        'Admin Security',
+        lockedOut
+          ? 'Temporarily blocked repeated failed admin login attempts.'
+          : 'Failed admin login attempt rejected.'
+      );
+      res.status(lockedOut ? 429 : 401).json({
+        error: lockedOut
+          ? 'Too many failed attempts. Please wait 15 minutes before trying again.'
+          : 'Incorrect password',
+      });
       return;
     }
+    clearRateLimit('admin_login', ip);
     const { signedToken } = createSession(user.id);
-    setSessionCookie(res, signedToken);
+    setSessionCookie(req, res, signedToken);
     logActivity('ADMIN_LOGIN', user.username, 'Signed in to Admin Portal.');
     res.json({ user, token: signedToken });
   });
 
   app.post('/api/auth/logout', (req: Request, res: Response) => {
     const token = extractSessionToken(req);
+    const user = getSessionUser(token);
     deleteSession(token);
     res.clearCookie(SESSION_COOKIE, { path: '/' });
+    if (user) {
+      logActivity('ADMIN_LOGOUT', user.username, 'Signed out of Admin Portal.');
+    }
     res.json({ ok: true });
   });
 
@@ -205,7 +322,10 @@ async function startServer() {
 
   // -------- PUBLIC ROUTES --------
   app.get('/api/public/site', (req: Request, res: Response) => {
+    const unlockToken = extractUnlockToken(req);
+    const security = getPublicSecurityState(unlockToken);
     const wantsPreview = req.query.preview === '1';
+
     if (wantsPreview) {
       const token = extractSessionToken(req);
       const user = getSessionUser(token);
@@ -213,21 +333,80 @@ async function startServer() {
         const draftDoc = getSiteDocument('draft');
         res.json({
           mode: 'preview',
+          locked: false,
           updatedAt: draftDoc.updatedAt,
           data: draftDoc.state,
+          security,
         });
         return;
       }
     }
+
+    if (security.locked) {
+      res.json({
+        mode: 'locked',
+        locked: true,
+        updatedAt: null,
+        data: null,
+        security,
+      });
+      return;
+    }
+
     const publishedDoc = getSiteDocument('published');
     res.json({
       mode: 'published',
+      locked: false,
       updatedAt: publishedDoc.updatedAt,
       data: publishedDoc.state,
+      security,
     });
   });
 
+  app.post('/api/public/unlock', (req: Request, res: Response) => {
+    const ip = getClientIp(req);
+    const limit = checkRateLimit('site_unlock', ip, 10 * 60 * 1000);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSec));
+      res.status(429).json({
+        error: `Too many failed attempts. Try again in ${Math.ceil(limit.retryAfterSec / 60)} minute(s).`,
+      });
+      return;
+    }
+
+    const { credential } = req.body as { credential?: string };
+    const result = verifySiteLockCredential(typeof credential === 'string' ? credential : '');
+    if (!result.ok) {
+      const lockedOut = recordRateFailure('site_unlock', ip, 5, 10 * 60 * 1000, 10 * 60 * 1000);
+      logActivity(
+        lockedOut ? 'SITE_UNLOCK_RATE_LIMITED' : 'SITE_UNLOCK_FAILED',
+        'Website Lock',
+        lockedOut
+          ? 'Temporarily blocked repeated failed website unlock attempts.'
+          : 'Failed website lock credential attempt.'
+      );
+      res.status(lockedOut ? 429 : 401).json({
+        error: lockedOut
+          ? 'Too many failed attempts. Please wait 10 minutes before trying again.'
+          : result.error,
+      });
+      return;
+    }
+
+    clearRateLimit('site_unlock', ip);
+    setUnlockCookie(req, res, result.unlockToken);
+    logActivity('SITE_UNLOCK_SUCCESS', 'Website Lock', 'Visitor unlocked website with valid credential.');
+    res.json({ ok: true, unlockToken: result.unlockToken });
+  });
+
   app.post('/api/public/contact', (req: Request, res: Response) => {
+    const unlockToken = extractUnlockToken(req);
+    const adminUser = getSessionUser(extractSessionToken(req));
+    if (!adminUser && isWebsiteLockedForToken(unlockToken)) {
+      res.status(423).json({ error: 'Website is currently locked.' });
+      return;
+    }
+
     const { name, email, service, budget, message } = req.body as {
       name?: string;
       email?: string;
@@ -465,7 +644,126 @@ async function startServer() {
   });
 
   app.get('/api/admin/activity', requireAdmin, (_req: Request, res: Response) => {
-    res.json({ items: listRecentActivity(80) });
+    res.json({ items: listRecentActivity(150) });
+  });
+
+  // -------- PROTECTED ADMIN SECURITY & SHORTCUT ROUTES --------
+  app.get('/api/admin/security', requireAdmin, (_req: Request, res: Response) => {
+    res.json({
+      settings: getAdminSecuritySettings(),
+      publicSecurity: getPublicSecurityState(null),
+    });
+  });
+
+  app.put('/api/admin/security/shortcut', requireAdmin, (req: Request, res: Response) => {
+    const body = (req.body || {}) as {
+      ctrl?: boolean;
+      shift?: boolean;
+      alt?: boolean;
+      meta?: boolean;
+      key?: string;
+    };
+    const result = updateAdminShortcut({
+      ctrl: Boolean(body.ctrl),
+      shift: Boolean(body.shift),
+      alt: Boolean(body.alt),
+      meta: Boolean(body.meta),
+      key: typeof body.key === 'string' ? body.key : '',
+    });
+    if (!result.ok) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    res.json({
+      ok: true,
+      settings: result.settings,
+      publicSecurity: getPublicSecurityState(null),
+    });
+  });
+
+  app.post('/api/admin/security/shortcut/reset', requireAdmin, (_req: Request, res: Response) => {
+    const settings = resetAdminShortcut();
+    res.json({
+      ok: true,
+      settings,
+      publicSecurity: getPublicSecurityState(null),
+    });
+  });
+
+  app.put('/api/admin/security/lock', requireAdmin, (req: Request, res: Response) => {
+    const body = (req.body || {}) as {
+      enabled?: boolean;
+      lockType?: WebsiteLockType;
+      lockMessage?: string;
+      newCredential?: string;
+      confirmCredential?: string;
+    };
+    const result = updateWebsiteLockSettings({
+      enabled: Boolean(body.enabled),
+      lockType: body.lockType === 'pin' ? 'pin' : 'password',
+      lockMessage: typeof body.lockMessage === 'string' ? body.lockMessage : '',
+      newCredential: typeof body.newCredential === 'string' ? body.newCredential : undefined,
+      confirmCredential: typeof body.confirmCredential === 'string' ? body.confirmCredential : undefined,
+    });
+    if (!result.ok) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    if (result.settings.websiteLock.enabled) {
+      res.clearCookie(UNLOCK_COOKIE, { path: '/' });
+    }
+    res.json({
+      ok: true,
+      settings: result.settings,
+      publicSecurity: getPublicSecurityState(null),
+    });
+  });
+
+  app.post('/api/admin/security/lock-now', requireAdmin, (_req: Request, res: Response) => {
+    const result = setWebsiteLockActive(true);
+    if (!result.ok) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    res.clearCookie(UNLOCK_COOKIE, { path: '/' });
+    res.json({
+      ok: true,
+      settings: result.settings,
+      publicSecurity: getPublicSecurityState(null),
+    });
+  });
+
+  app.post('/api/admin/security/unlock-site', requireAdmin, (_req: Request, res: Response) => {
+    const result = setWebsiteLockActive(false);
+    if (!result.ok) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    res.json({
+      ok: true,
+      settings: result.settings,
+      publicSecurity: getPublicSecurityState(null),
+    });
+  });
+
+  app.put('/api/admin/security/session-timeout', requireAdmin, (req: Request, res: Response) => {
+    const { minutes } = (req.body || {}) as { minutes?: number };
+    const result = updateSessionTimeoutMinutes(Number(minutes));
+    if (!result.ok) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    res.json({ ok: true, settings: result.settings });
+  });
+
+  app.post('/api/admin/security/reset', requireAdmin, (_req: Request, res: Response) => {
+    const settings = resetSecuritySettings();
+    res.clearCookie(UNLOCK_COOKIE, { path: '/' });
+    res.json({
+      ok: true,
+      settings,
+      publicSecurity: getPublicSecurityState(null),
+    });
   });
 
   // -------- VITE / STATIC SPA HOSTING --------

@@ -1,14 +1,18 @@
 import type {
   ActivityLogItem,
+  AdminSecuritySettings,
   CmsSiteState,
   ContactMessage,
   DashboardOverview,
   MediaFolder,
   MediaItem,
   MessageStatus,
+  PublicSecurityState,
+  WebsiteLockType,
 } from '../types/cms';
 
 const TOKEN_KEY = 'ms_admin_token';
+const UNLOCK_TOKEN_KEY = 'ms_site_unlock_token';
 
 export function getStoredAdminToken(): string | null {
   try {
@@ -30,7 +34,27 @@ export function setStoredAdminToken(token: string | null): void {
   }
 }
 
-export function broadcastSiteSync(reason: 'draft' | 'published'): void {
+export function getStoredUnlockToken(): string | null {
+  try {
+    return sessionStorage.getItem(UNLOCK_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setStoredUnlockToken(token: string | null): void {
+  try {
+    if (token) {
+      sessionStorage.setItem(UNLOCK_TOKEN_KEY, token);
+    } else {
+      sessionStorage.removeItem(UNLOCK_TOKEN_KEY);
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function broadcastSiteSync(reason: 'draft' | 'published' | 'security'): void {
   try {
     const channel = new BroadcastChannel('ms_cms_sync');
     channel.postMessage({ reason, at: Date.now() });
@@ -38,6 +62,13 @@ export function broadcastSiteSync(reason: 'draft' | 'published'): void {
   } catch {
     // Ignore unsupported environments
   }
+}
+
+export function notifySecurityUpdated(publicSecurity?: PublicSecurityState): void {
+  if (publicSecurity && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('ms:security-updated', { detail: publicSecurity }));
+  }
+  broadcastSiteSync('security');
 }
 
 async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
@@ -58,6 +89,10 @@ async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    if (res.status === 401 && url.startsWith('/api/admin/') && typeof window !== 'undefined') {
+      setStoredAdminToken(null);
+      window.dispatchEvent(new CustomEvent('ms:admin-unauthorized'));
+    }
     throw new Error((data as { error?: string }).error || `Request failed (${res.status})`);
   }
   return data as T;
@@ -191,4 +226,115 @@ export const adminApi = {
     }),
 
   listActivity: () => apiFetch<{ items: ActivityLogItem[] }>('/api/admin/activity'),
+
+  getSecurity: () =>
+    apiFetch<{ settings: AdminSecuritySettings; publicSecurity: PublicSecurityState }>(
+      '/api/admin/security'
+    ),
+
+  updateShortcut: async (payload: {
+    ctrl: boolean;
+    shift: boolean;
+    alt: boolean;
+    meta: boolean;
+    key: string;
+  }) => {
+    const res = await apiFetch<{
+      ok: boolean;
+      settings: AdminSecuritySettings;
+      publicSecurity: PublicSecurityState;
+    }>('/api/admin/security/shortcut', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+    notifySecurityUpdated(res.publicSecurity);
+    return res;
+  },
+
+  resetShortcut: async () => {
+    const res = await apiFetch<{
+      ok: boolean;
+      settings: AdminSecuritySettings;
+      publicSecurity: PublicSecurityState;
+    }>('/api/admin/security/shortcut/reset', {
+      method: 'POST',
+    });
+    notifySecurityUpdated(res.publicSecurity);
+    return res;
+  },
+
+  updateWebsiteLock: async (payload: {
+    enabled: boolean;
+    lockType: WebsiteLockType;
+    lockMessage: string;
+    newCredential?: string;
+    confirmCredential?: string;
+  }) => {
+    const res = await apiFetch<{
+      ok: boolean;
+      settings: AdminSecuritySettings;
+      publicSecurity: PublicSecurityState;
+    }>('/api/admin/security/lock', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+    notifySecurityUpdated(res.publicSecurity);
+    return res;
+  },
+
+  lockWebsiteNow: async () => {
+    const res = await apiFetch<{
+      ok: boolean;
+      settings: AdminSecuritySettings;
+      publicSecurity: PublicSecurityState;
+    }>('/api/admin/security/lock-now', {
+      method: 'POST',
+    });
+    notifySecurityUpdated(res.publicSecurity);
+    return res;
+  },
+
+  unlockWebsite: async () => {
+    const res = await apiFetch<{
+      ok: boolean;
+      settings: AdminSecuritySettings;
+      publicSecurity: PublicSecurityState;
+    }>('/api/admin/security/unlock-site', {
+      method: 'POST',
+    });
+    notifySecurityUpdated(res.publicSecurity);
+    return res;
+  },
+
+  updateSessionTimeout: (minutes: number) =>
+    apiFetch<{ ok: boolean; settings: AdminSecuritySettings }>(
+      '/api/admin/security/session-timeout',
+      {
+        method: 'PUT',
+        body: JSON.stringify({ minutes }),
+      }
+    ),
+
+  resetSecurity: async () => {
+    const res = await apiFetch<{
+      ok: boolean;
+      settings: AdminSecuritySettings;
+      publicSecurity: PublicSecurityState;
+    }>('/api/admin/security/reset', {
+      method: 'POST',
+    });
+    notifySecurityUpdated(res.publicSecurity);
+    return res;
+  },
+
+  unlockPublicSite: async (credential: string) => {
+    const res = await apiFetch<{ ok: boolean; unlockToken?: string }>('/api/public/unlock', {
+      method: 'POST',
+      body: JSON.stringify({ credential }),
+    });
+    if (res.unlockToken) {
+      setStoredUnlockToken(res.unlockToken);
+    }
+    return res;
+  },
 };

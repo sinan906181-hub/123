@@ -3,14 +3,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { DEFAULT_CMS_STATE } from '../src/config/defaultCmsState.ts';
+import { serializeCanonicalShortcut, validateShortcutConfig } from '../src/lib/shortcut.ts';
 import type {
   ActivityLogItem,
+  AdminSecuritySettings,
+  AdminShortcutConfig,
   CmsSiteState,
   ContactMessage,
   DashboardOverview,
   MediaFolder,
   MediaItem,
   MessageStatus,
+  PublicSecurityState,
+  WebsiteLockType,
 } from '../src/types/cms.ts';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
@@ -96,7 +101,31 @@ db.exec(`
     detail TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS site_security (
+    id TEXT PRIMARY KEY,
+    shortcut_ctrl INTEGER NOT NULL DEFAULT 1,
+    shortcut_shift INTEGER NOT NULL DEFAULT 1,
+    shortcut_alt INTEGER NOT NULL DEFAULT 0,
+    shortcut_meta INTEGER NOT NULL DEFAULT 0,
+    shortcut_key TEXT NOT NULL DEFAULT 's',
+    shortcut_challenge TEXT NOT NULL,
+    lock_enabled INTEGER NOT NULL DEFAULT 0,
+    lock_type TEXT NOT NULL DEFAULT 'password',
+    lock_message TEXT NOT NULL DEFAULT 'This portfolio is currently locked. Enter access credentials to continue.',
+    lock_credential_hash TEXT NOT NULL DEFAULT '',
+    lock_credential_salt TEXT NOT NULL DEFAULT '',
+    lock_version INTEGER NOT NULL DEFAULT 1,
+    session_timeout_minutes INTEGER NOT NULL DEFAULT 30,
+    last_security_change_at TEXT
+  );
 `);
+
+try {
+  db.exec('ALTER TABLE admin_sessions ADD COLUMN last_active_at TEXT');
+} catch {
+  // Column already exists
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -212,6 +241,26 @@ export function bootstrapDatabase(): void {
       `INSERT INTO admin_users (id, email, username, password_hash, salt, role, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, 'ADMIN', ?, ?)`
     ).run(crypto.randomUUID(), email, username, hash, salt, ts, ts);
+  }
+
+  // Seed security settings row if absent
+  const secRow = db
+    .prepare('SELECT id FROM site_security WHERE id = ?')
+    .get('default') as { id: string } | undefined;
+  if (!secRow) {
+    db.prepare(
+      `INSERT INTO site_security (
+        id, shortcut_ctrl, shortcut_shift, shortcut_alt, shortcut_meta, shortcut_key,
+        shortcut_challenge, lock_enabled, lock_type, lock_message,
+        lock_credential_hash, lock_credential_salt, lock_version,
+        session_timeout_minutes, last_security_change_at
+      ) VALUES (?, 1, 1, 0, 0, 's', ?, 0, 'password', ?, '', '', 1, 30, ?)`
+    ).run(
+      'default',
+      crypto.randomBytes(16).toString('hex'),
+      'This website is protected. Enter the access credential to continue.',
+      ts
+    );
   }
 
   // Initial activity log & sample messages only on clean DB
@@ -406,8 +455,8 @@ export function createSession(userId: string): { signedToken: string; expiresAt:
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
   db.prepare(
-    'INSERT INTO admin_sessions (token_id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
-  ).run(tokenId, userId, expiresAt, createdAt);
+    'INSERT INTO admin_sessions (token_id, user_id, expires_at, created_at, last_active_at) VALUES (?, ?, ?, ?, ?)'
+  ).run(tokenId, userId, expiresAt, createdAt, createdAt);
   return { signedToken: signSessionToken(tokenId), expiresAt };
 }
 
@@ -422,20 +471,42 @@ export function getSessionUser(signedToken: string | undefined | null): {
 
   const row = db
     .prepare(
-      `SELECT u.id, u.email, u.username, s.expires_at
+      `SELECT u.id, u.email, u.username, s.expires_at, s.last_active_at, s.created_at
        FROM admin_sessions s
        JOIN admin_users u ON u.id = s.user_id
        WHERE s.token_id = ?`
     )
     .get(tokenId) as
-    | { id: string; email: string; username: string; expires_at: string }
+    | {
+        id: string;
+        email: string;
+        username: string;
+        expires_at: string;
+        last_active_at: string | null;
+        created_at: string;
+      }
     | undefined;
 
   if (!row) return null;
-  if (new Date(row.expires_at).getTime() <= Date.now()) {
+  const nowMs = Date.now();
+  if (new Date(row.expires_at).getTime() <= nowMs) {
     db.prepare('DELETE FROM admin_sessions WHERE token_id = ?').run(tokenId);
     return null;
   }
+
+  const sec = getRawSecurityRow();
+  const timeoutMs = Math.max(5, Math.min(1440, sec.session_timeout_minutes || 30)) * 60 * 1000;
+  const lastActiveMs = new Date(row.last_active_at || row.created_at).getTime();
+  if (Number.isFinite(lastActiveMs) && nowMs - lastActiveMs > timeoutMs) {
+    db.prepare('DELETE FROM admin_sessions WHERE token_id = ?').run(tokenId);
+    return null;
+  }
+
+  db.prepare('UPDATE admin_sessions SET last_active_at = ? WHERE token_id = ?').run(
+    new Date(nowMs).toISOString(),
+    tokenId
+  );
+
   return { id: row.id, email: row.email, username: row.username };
 }
 
@@ -445,6 +516,387 @@ export function deleteSession(signedToken: string | undefined | null): void {
   if (tokenId) {
     db.prepare('DELETE FROM admin_sessions WHERE token_id = ?').run(tokenId);
   }
+}
+
+export function deleteAllAdminSessions(): void {
+  db.prepare('DELETE FROM admin_sessions').run();
+}
+
+// -------- WEBSITE SECURITY & SHORTCUT SETTINGS --------
+
+const DEFAULT_ADMIN_SHORTCUT: AdminShortcutConfig = {
+  ctrl: true,
+  shift: true,
+  alt: false,
+  meta: false,
+  key: 's',
+  label: 'Ctrl + Shift + S',
+};
+
+const DEFAULT_LOCK_MESSAGE =
+  'This website is protected. Enter the access credential to continue.';
+
+interface SiteSecurityRow {
+  id: string;
+  shortcut_ctrl: number;
+  shortcut_shift: number;
+  shortcut_alt: number;
+  shortcut_meta: number;
+  shortcut_key: string;
+  shortcut_challenge: string;
+  lock_enabled: number;
+  lock_type: string;
+  lock_message: string;
+  lock_credential_hash: string;
+  lock_credential_salt: string;
+  lock_version: number;
+  session_timeout_minutes: number;
+  last_security_change_at: string | null;
+}
+
+function getRawSecurityRow(): SiteSecurityRow {
+  let row = db.prepare('SELECT * FROM site_security WHERE id = ?').get('default') as unknown as
+    | SiteSecurityRow
+    | undefined;
+  if (!row) {
+    const ts = nowIso();
+    const challenge = crypto.randomBytes(16).toString('hex');
+    db.prepare(
+      `INSERT INTO site_security (
+        id, shortcut_ctrl, shortcut_shift, shortcut_alt, shortcut_meta, shortcut_key,
+        shortcut_challenge, lock_enabled, lock_type, lock_message,
+        lock_credential_hash, lock_credential_salt, lock_version,
+        session_timeout_minutes, last_security_change_at
+      ) VALUES (?, 1, 1, 0, 0, 's', ?, 0, 'password', ?, '', '', 1, 30, ?)`
+    ).run('default', challenge, DEFAULT_LOCK_MESSAGE, ts);
+    row = db
+      .prepare('SELECT * FROM site_security WHERE id = ?')
+      .get('default') as unknown as SiteSecurityRow;
+  }
+  return row;
+}
+
+function rowToShortcut(row: SiteSecurityRow): AdminShortcutConfig {
+  const validated = validateShortcutConfig({
+    ctrl: Boolean(row.shortcut_ctrl),
+    shift: Boolean(row.shortcut_shift),
+    alt: Boolean(row.shortcut_alt),
+    meta: Boolean(row.shortcut_meta),
+    key: row.shortcut_key || 's',
+  });
+  return validated.ok ? validated.shortcut : DEFAULT_ADMIN_SHORTCUT;
+}
+
+function sanitizeText(input: string, maxLen = 280): string {
+  return String(input || '')
+    .replace(/[\u0000-\u001F\u007F<>]/g, '')
+    .trim()
+    .slice(0, maxLen);
+}
+
+export function computeServerShortcutDigest(challenge: string, shortcut: AdminShortcutConfig): string {
+  return crypto
+    .createHmac('sha256', challenge)
+    .update(serializeCanonicalShortcut(shortcut))
+    .digest('hex');
+}
+
+export function signSiteUnlockToken(lockVersion: number): string {
+  const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
+  const payload = `${lockVersion}:${expiresAt}:${crypto.randomBytes(8).toString('hex')}`;
+  const sig = crypto
+    .createHmac('sha256', getSessionSecret())
+    .update(`unlock:${payload}`)
+    .digest('hex');
+  return `${payload}.${sig}`;
+}
+
+export function verifySiteUnlockToken(
+  token: string | undefined | null,
+  expectedLockVersion: number
+): boolean {
+  if (!token) return false;
+  const dotIdx = token.lastIndexOf('.');
+  if (dotIdx <= 0) return false;
+  const payload = token.slice(0, dotIdx);
+  const sig = token.slice(dotIdx + 1);
+  if (!payload || !sig) return false;
+
+  const expectedSig = crypto
+    .createHmac('sha256', getSessionSecret())
+    .update(`unlock:${payload}`)
+    .digest('hex');
+  const a = Buffer.from(sig, 'hex');
+  const b = Buffer.from(expectedSig, 'hex');
+  if (a.length !== b.length || a.length === 0) return false;
+  if (!crypto.timingSafeEqual(a, b)) return false;
+
+  const [verStr, expStr] = payload.split(':');
+  const ver = Number(verStr);
+  const exp = Number(expStr);
+  if (!Number.isFinite(ver) || !Number.isFinite(exp)) return false;
+  if (ver !== expectedLockVersion) return false;
+  if (Date.now() > exp) return false;
+  return true;
+}
+
+export function isWebsiteLockedForToken(unlockToken?: string | null): boolean {
+  const row = getRawSecurityRow();
+  if (!row.lock_enabled) return false;
+  return !verifySiteUnlockToken(unlockToken, row.lock_version);
+}
+
+export function getPublicSecurityState(unlockToken?: string | null): PublicSecurityState {
+  const row = getRawSecurityRow();
+  const shortcut = rowToShortcut(row);
+  const published = getSiteDocument('published').state;
+  const lockType: WebsiteLockType = row.lock_type === 'pin' ? 'pin' : 'password';
+  const locked = Boolean(row.lock_enabled) && !verifySiteUnlockToken(unlockToken, row.lock_version);
+
+  return {
+    locked,
+    lockType,
+    lockMessage: row.lock_message || DEFAULT_LOCK_MESSAGE,
+    siteName: published.settings.siteName || published.home.name,
+    logoUrl: published.settings.logoUrl || '',
+    shortcutChallenge: row.shortcut_challenge,
+    shortcutDigest: computeServerShortcutDigest(row.shortcut_challenge, shortcut),
+  };
+}
+
+export function verifySiteLockCredential(
+  credential: string
+): { ok: true; unlockToken: string } | { ok: false; error: string } {
+  const row = getRawSecurityRow();
+  if (!row.lock_enabled) {
+    return { ok: true, unlockToken: signSiteUnlockToken(row.lock_version) };
+  }
+  if (!row.lock_credential_hash || !row.lock_credential_salt) {
+    return { ok: false, error: 'Website lock credential is not configured.' };
+  }
+  const clean = String(credential || '');
+  if (!clean) {
+    return {
+      ok: false,
+      error: row.lock_type === 'pin' ? 'Please enter the PIN.' : 'Please enter the password.',
+    };
+  }
+  if (!verifyPassword(clean, row.lock_credential_hash, row.lock_credential_salt)) {
+    return {
+      ok: false,
+      error:
+        row.lock_type === 'pin'
+          ? 'Incorrect PIN. Please try again.'
+          : 'Incorrect password. Please try again.',
+    };
+  }
+  return { ok: true, unlockToken: signSiteUnlockToken(row.lock_version) };
+}
+
+export function getAdminSecuritySettings(): AdminSecuritySettings {
+  const row = getRawSecurityRow();
+  const published = getSiteDocument('published').state;
+  const lockEnabled = Boolean(row.lock_enabled);
+  const websiteStatus: AdminSecuritySettings['websiteStatus'] = lockEnabled
+    ? 'LOCKED'
+    : published.settings.maintenanceMode
+      ? 'MAINTENANCE'
+      : 'ONLINE';
+
+  return {
+    shortcut: rowToShortcut(row),
+    defaultShortcutLabel: DEFAULT_ADMIN_SHORTCUT.label,
+    websiteLock: {
+      enabled: lockEnabled,
+      lockType: row.lock_type === 'pin' ? 'pin' : 'password',
+      lockMessage: row.lock_message || DEFAULT_LOCK_MESSAGE,
+      hasCredential: Boolean(row.lock_credential_hash && row.lock_credential_salt),
+    },
+    sessionTimeoutMinutes: row.session_timeout_minutes || 30,
+    lastSecurityChangeAt: row.last_security_change_at,
+    adminProtected: true,
+    websiteStatus,
+  };
+}
+
+export function updateAdminShortcut(input: {
+  ctrl: boolean;
+  shift: boolean;
+  alt: boolean;
+  meta: boolean;
+  key: string;
+}): { ok: true; settings: AdminSecuritySettings } | { ok: false; error: string } {
+  const result = validateShortcutConfig(input);
+  if (!result.ok) {
+    return { ok: false, error: result.error };
+  }
+  const { shortcut } = result;
+  const ts = nowIso();
+  const nextChallenge = crypto.randomBytes(16).toString('hex');
+  db.prepare(
+    `UPDATE site_security
+     SET shortcut_ctrl = ?, shortcut_shift = ?, shortcut_alt = ?, shortcut_meta = ?, shortcut_key = ?,
+         shortcut_challenge = ?, last_security_change_at = ?
+     WHERE id = 'default'`
+  ).run(
+    shortcut.ctrl ? 1 : 0,
+    shortcut.shift ? 1 : 0,
+    shortcut.alt ? 1 : 0,
+    shortcut.meta ? 1 : 0,
+    shortcut.key,
+    nextChallenge,
+    ts
+  );
+  logActivity('SHORTCUT_UPDATED', 'Admin Access', `Updated admin portal shortcut to ${shortcut.label}.`);
+  return { ok: true, settings: getAdminSecuritySettings() };
+}
+
+export function resetAdminShortcut(): AdminSecuritySettings {
+  const ts = nowIso();
+  const nextChallenge = crypto.randomBytes(16).toString('hex');
+  db.prepare(
+    `UPDATE site_security
+     SET shortcut_ctrl = 1, shortcut_shift = 1, shortcut_alt = 0, shortcut_meta = 0, shortcut_key = 's',
+         shortcut_challenge = ?, last_security_change_at = ?
+     WHERE id = 'default'`
+  ).run(nextChallenge, ts);
+  logActivity('SHORTCUT_RESET', 'Admin Access', 'Reset admin portal shortcut to default.');
+  return getAdminSecuritySettings();
+}
+
+export function updateWebsiteLockSettings(params: {
+  enabled: boolean;
+  lockType: WebsiteLockType;
+  lockMessage: string;
+  newCredential?: string;
+  confirmCredential?: string;
+}): { ok: true; settings: AdminSecuritySettings } | { ok: false; error: string } {
+  const row = getRawSecurityRow();
+  const lockType: WebsiteLockType = params.lockType === 'pin' ? 'pin' : 'password';
+  const enabled = Boolean(params.enabled);
+  const lockMessage =
+    sanitizeText(params.lockMessage, 280) || DEFAULT_LOCK_MESSAGE;
+  const newCred = typeof params.newCredential === 'string' ? params.newCredential : '';
+  const confirmCred = typeof params.confirmCredential === 'string' ? params.confirmCredential : '';
+
+  let nextHash = row.lock_credential_hash;
+  let nextSalt = row.lock_credential_salt;
+  let nextVersion = row.lock_version;
+
+  if (newCred.length > 0 || confirmCred.length > 0) {
+    if (newCred !== confirmCred) {
+      return { ok: false, error: 'New credential and confirmation do not match.' };
+    }
+    if (lockType === 'pin') {
+      if (!/^\d{4,12}$/.test(newCred)) {
+        return { ok: false, error: 'PIN must be 4 to 12 numeric digits (0–9).' };
+      }
+    } else if (newCred.length < 4 || newCred.length > 128) {
+      return { ok: false, error: 'Lock password must be between 4 and 128 characters.' };
+    }
+    const hashed = hashPassword(newCred);
+    nextHash = hashed.hash;
+    nextSalt = hashed.salt;
+    nextVersion += 1;
+  } else if (lockType !== row.lock_type && row.lock_credential_hash) {
+    return {
+      ok: false,
+      error: `Enter and confirm a new ${lockType === 'pin' ? 'PIN' : 'password'} when switching lock type.`,
+    };
+  }
+
+  if (enabled && (!nextHash || !nextSalt)) {
+    return {
+      ok: false,
+      error: `Set and confirm a ${lockType === 'pin' ? 'PIN' : 'password'} before enabling Website Lock.`,
+    };
+  }
+
+  if (enabled !== Boolean(row.lock_enabled)) {
+    nextVersion += 1;
+  }
+
+  const ts = nowIso();
+  db.prepare(
+    `UPDATE site_security
+     SET lock_enabled = ?, lock_type = ?, lock_message = ?,
+         lock_credential_hash = ?, lock_credential_salt = ?, lock_version = ?,
+         last_security_change_at = ?
+     WHERE id = 'default'`
+  ).run(enabled ? 1 : 0, lockType, lockMessage, nextHash, nextSalt, nextVersion, ts);
+
+  if (enabled && !row.lock_enabled) {
+    logActivity('WEBSITE_LOCKED', 'Website Security', `Enabled Website Lock (${lockType.toUpperCase()}).`);
+  } else if (!enabled && row.lock_enabled) {
+    logActivity('WEBSITE_UNLOCKED', 'Website Security', 'Disabled Website Lock; public site is online.');
+  } else {
+    logActivity(
+      'LOCK_SETTINGS_UPDATED',
+      'Website Security',
+      `Updated Website Lock settings (${lockType.toUpperCase()}).`
+    );
+  }
+
+  return { ok: true, settings: getAdminSecuritySettings() };
+}
+
+export function setWebsiteLockActive(
+  locked: boolean
+): { ok: true; settings: AdminSecuritySettings } | { ok: false; error: string } {
+  const row = getRawSecurityRow();
+  if (locked && (!row.lock_credential_hash || !row.lock_credential_salt)) {
+    return {
+      ok: false,
+      error: 'Please configure a Website Lock password or PIN before locking the site.',
+    };
+  }
+  const ts = nowIso();
+  const nextVersion = row.lock_version + 1;
+  db.prepare(
+    `UPDATE site_security
+     SET lock_enabled = ?, lock_version = ?, last_security_change_at = ?
+     WHERE id = 'default'`
+  ).run(locked ? 1 : 0, nextVersion, ts);
+
+  logActivity(
+    locked ? 'WEBSITE_LOCKED' : 'WEBSITE_UNLOCKED',
+    'Website Security',
+    locked ? 'Locked public website immediately.' : 'Unlocked public website immediately.'
+  );
+  return { ok: true, settings: getAdminSecuritySettings() };
+}
+
+export function updateSessionTimeoutMinutes(
+  minutes: number
+): { ok: true; settings: AdminSecuritySettings } | { ok: false; error: string } {
+  const parsed = Math.round(Number(minutes));
+  if (!Number.isFinite(parsed) || parsed < 5 || parsed > 1440) {
+    return { ok: false, error: 'Session timeout must be between 5 and 1440 minutes.' };
+  }
+  const ts = nowIso();
+  db.prepare(
+    `UPDATE site_security
+     SET session_timeout_minutes = ?, last_security_change_at = ?
+     WHERE id = 'default'`
+  ).run(parsed, ts);
+  logActivity('SESSION_TIMEOUT_UPDATED', 'Admin Security', `Updated admin idle timeout to ${parsed} minutes.`);
+  return { ok: true, settings: getAdminSecuritySettings() };
+}
+
+export function resetSecuritySettings(): AdminSecuritySettings {
+  const row = getRawSecurityRow();
+  const ts = nowIso();
+  const nextChallenge = crypto.randomBytes(16).toString('hex');
+  db.prepare(
+    `UPDATE site_security
+     SET shortcut_ctrl = 1, shortcut_shift = 1, shortcut_alt = 0, shortcut_meta = 0, shortcut_key = 's',
+         shortcut_challenge = ?, lock_enabled = 0, lock_type = 'password', lock_message = ?,
+         lock_credential_hash = '', lock_credential_salt = '', lock_version = ?,
+         session_timeout_minutes = 30, last_security_change_at = ?
+     WHERE id = 'default'`
+  ).run(nextChallenge, DEFAULT_LOCK_MESSAGE, row.lock_version + 1, ts);
+  logActivity('SECURITY_RESET', 'Website Security', 'Reset website lock and shortcut settings to defaults.');
+  return getAdminSecuritySettings();
 }
 
 export function listMediaFolders(): MediaFolder[] {

@@ -41,37 +41,43 @@ function sampleTextTargets(
   height: number,
   targetCount: number
 ): Float32Array {
-  const off = document.createElement('canvas');
-  off.width = width;
-  off.height = height;
-  const ctx = off.getContext('2d');
+  const safeW = Math.floor(width);
+  const safeH = Math.floor(height);
   const out = new Float32Array(targetCount * 2);
+  if (!Number.isFinite(safeW) || !Number.isFinite(safeH) || safeW < 2 || safeH < 2) {
+    return out;
+  }
+
+  const off = document.createElement('canvas');
+  off.width = safeW;
+  off.height = safeH;
+  const ctx = off.getContext('2d');
   if (!ctx) return out;
 
-  const isMobile = width < 640;
+  const isMobile = safeW < 640;
   const baseFont =
     text.length > 9
       ? isMobile
-        ? Math.max(32, width * 0.088)
-        : Math.min(92, width * 0.075)
+        ? Math.max(32, safeW * 0.088)
+        : Math.min(92, safeW * 0.075)
       : isMobile
-        ? Math.max(44, width * 0.125)
-        : Math.min(116, width * 0.095);
+        ? Math.max(44, safeW * 0.125)
+        : Math.min(116, safeW * 0.095);
 
-  ctx.clearRect(0, 0, width, height);
+  ctx.clearRect(0, 0, safeW, safeH);
   ctx.fillStyle = '#FFFFFF';
   ctx.font = `800 ${Math.round(baseFont)}px "Outfit", ui-sans-serif, system-ui, sans-serif`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(text, width / 2, height / 2);
+  ctx.fillText(text, safeW / 2, safeH / 2);
 
-  const img = ctx.getImageData(0, 0, width, height).data;
-  const step = width < 640 ? 3 : 3;
+  const img = ctx.getImageData(0, 0, safeW, safeH).data;
+  const step = 3;
   const raw: number[] = [];
 
-  for (let y = 0; y < height; y += step) {
-    for (let x = 0; x < width; x += step) {
-      if (img[(y * width + x) * 4 + 3] > 128) {
+  for (let y = 0; y < safeH; y += step) {
+    for (let x = 0; x < safeW; x += step) {
+      if (img[(y * safeW + x) * 4 + 3] > 128) {
         raw.push(x, y);
       }
     }
